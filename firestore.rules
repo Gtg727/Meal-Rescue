@@ -1,0 +1,259 @@
+rules_version = '2';
+
+// MealRescue Firestore security rules.
+//
+// Design notes
+//  * The app runs inventory changes in client transactions (see
+//    lib/services/reservation_service.dart). These rules make that safe enough
+//    for an MVP: ownership, field whitelists, legal status transitions and
+//    counter bounds are all validated here.
+//  * Role is stored on users/{uid}.role. Users cannot change it, and "admin"
+//    can only be assigned manually in the Firebase console.
+//  * For production, move reservation transactions into Cloud Functions and
+//    deny client writes to counters entirely (see README, "Security notes").
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------ helpers
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function roleOf(uid) {
+      return userDoc(uid).data.role;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && roleOf(request.auth.uid) == 'admin';
+    }
+
+    function isProvider() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && roleOf(request.auth.uid) == 'provider';
+    }
+
+    function isReceiver() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && roleOf(request.auth.uid) == 'receiver';
+    }
+
+    function changed(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // -------------------------------------------------------------- users
+    match /users/{uid} {
+      // Private: only the owner and admins can read profiles. Other users see
+      // only the denormalised names stored on donations and reservations.
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      // Self-registration as provider or receiver only; never verified/admin.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+             'fullName', 'email', 'phone', 'role', 'organizationName',
+             'defaultPickupArea', 'isVerified', 'createdAt'])
+        && request.resource.data.role in ['provider', 'receiver']
+        && request.resource.data.isVerified == false
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2
+        && request.resource.data.fullName.size() <= 100
+        && request.resource.data.email is string
+        && request.resource.data.createdAt == request.time;
+
+      // Owner: profile fields + push token only. Role/isVerified are immutable.
+      // Admin: may flip isVerified only.
+      allow update: if signedIn() && (
+        (request.auth.uid == uid
+          && changed(['fullName', 'phone', 'organizationName',
+                      'defaultPickupArea', 'fcmToken'])
+          && request.resource.data.fullName is string
+          && request.resource.data.fullName.size() >= 2
+          && request.resource.data.fullName.size() <= 100)
+        || (isAdmin() && changed(['isVerified'])
+          && request.resource.data.isVerified is bool)
+      );
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------- donations
+    match /donations/{donationId} {
+      allow read: if signedIn();
+
+      allow create: if isProvider()
+        && request.resource.data.providerId == request.auth.uid
+        && request.resource.data.status in ['draft', 'available']
+        && request.resource.data.reservedPortions == 0
+        && request.resource.data.pendingPortions == 0
+        && request.resource.data.completedPortions == 0
+        && request.resource.data.totalPortions is int
+        && request.resource.data.totalPortions > 0
+        && request.resource.data.totalPortions <= 10000
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 3
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.description is string
+        && request.resource.data.pickupAddress is string
+        && request.resource.data.pickupAddress.size() > 0
+        // Photo is a compressed base64 data URI (<= ~400 KB) or empty.
+        && request.resource.data.imageUrl is string
+        && request.resource.data.imageUrl.size() < 600000
+        && request.resource.data.preparedAt is timestamp
+        && request.resource.data.pickupDeadline is timestamp
+        && request.resource.data.pickupDeadline > request.resource.data.preparedAt;
+
+      allow update: if signedIn() && (
+        // Owner: edit listing, change status, and settle counters when
+        // accepting, rejecting or completing pickups.
+        (resource.data.providerId == request.auth.uid
+          && request.resource.data.providerId == resource.data.providerId
+          && request.resource.data.totalPortions is int
+          && request.resource.data.imageUrl.size() < 600000
+          && request.resource.data.reservedPortions >= 0
+          && request.resource.data.pendingPortions >= 0
+          && request.resource.data.completedPortions >= 0
+          && request.resource.data.reservedPortions
+             + request.resource.data.pendingPortions
+             + request.resource.data.completedPortions
+             <= request.resource.data.totalPortions
+          && request.resource.data.status in
+             ['draft', 'available', 'reserved', 'completed', 'expired', 'cancelled'])
+        // Receiver: may only move the pending/reserved counters (create or
+        // cancel own reservation), never exceeding the listing total and
+        // only while the listing is published.
+        || (isReceiver()
+          && resource.data.status == 'available'
+          && changed(['pendingPortions', 'reservedPortions', 'updatedAt'])
+          && request.resource.data.pendingPortions >= 0
+          && request.resource.data.reservedPortions >= 0
+          && request.resource.data.reservedPortions
+             + request.resource.data.pendingPortions
+             + request.resource.data.completedPortions
+             <= request.resource.data.totalPortions)
+        // Admin moderation.
+        || isAdmin()
+      );
+
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------- reservations
+    match /reservations/{reservationId} {
+      // `get` is evaluated even for a document that does not exist yet (the
+      // idempotency check inside the create transaction), hence the null check.
+      allow get: if signedIn() && (
+        resource == null
+        || resource.data.receiverId == request.auth.uid
+        || resource.data.providerId == request.auth.uid
+        || isAdmin());
+
+      allow list: if signedIn() && (
+        resource.data.receiverId == request.auth.uid
+        || resource.data.providerId == request.auth.uid
+        || isAdmin());
+
+      allow create: if isReceiver()
+        && request.resource.data.receiverId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.receiverConfirmed == false
+        && request.resource.data.providerConfirmed == false
+        && request.resource.data.requestedPortions is int
+        && request.resource.data.requestedPortions > 0
+        // The reservation must point at a real, published listing owned by
+        // the stated provider, and its deadline must still be in the future.
+        && exists(/databases/$(database)/documents/donations/$(request.resource.data.donationId))
+        && get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.providerId
+             == request.resource.data.providerId
+        && get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.status
+             == 'available'
+        && get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.pickupDeadline
+             > request.time
+        // Pending counter must have been raised in the same transaction.
+        && getAfter(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.pendingPortions
+             == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.pendingPortions
+                + request.resource.data.requestedPortions;
+
+      allow update: if signedIn() && (
+        // Provider decisions and handover.
+        (resource.data.providerId == request.auth.uid && (
+          // pending -> accepted | rejected
+          (resource.data.status == 'pending'
+            && request.resource.data.status in ['accepted', 'rejected']
+            && changed(['status', 'acceptedAt', 'updatedAt']))
+          // accepted -> cancelled
+          || (resource.data.status == 'accepted'
+            && request.resource.data.status == 'cancelled'
+            && resource.data.receiverConfirmed == false
+            && changed(['status', 'updatedAt']))
+          // accepted -> completed (needs the receiver's confirmation first)
+          || (resource.data.status == 'accepted'
+            && resource.data.receiverConfirmed == true
+            && request.resource.data.status == 'completed'
+            && request.resource.data.providerConfirmed == true
+            && request.resource.data.collectedPortions is int
+            && request.resource.data.collectedPortions >= 1
+            && request.resource.data.collectedPortions
+               <= resource.data.requestedPortions
+            && changed(['status', 'providerConfirmed', 'collectedPortions',
+                        'completedAt', 'updatedAt']))
+          // overdue -> expired
+          || (resource.data.status in ['pending', 'accepted']
+            && resource.data.receiverConfirmed == false
+            && request.resource.data.status == 'expired'
+            && changed(['status', 'updatedAt']))
+        ))
+        // Receiver actions.
+        || (resource.data.receiverId == request.auth.uid && (
+          // pending | accepted -> cancelled
+          (resource.data.status in ['pending', 'accepted']
+            && resource.data.receiverConfirmed == false
+            && request.resource.data.status == 'cancelled'
+            && changed(['status', 'updatedAt']))
+          // confirm collection (status unchanged)
+          || (resource.data.status == 'accepted'
+            && resource.data.receiverConfirmed == false
+            && request.resource.data.receiverConfirmed == true
+            && request.resource.data.status == 'accepted'
+            && changed(['receiverConfirmed', 'updatedAt']))
+        ))
+        || isAdmin()
+      );
+
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ reports
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.donationId is string;
+
+      allow get, list: if signedIn()
+        && (resource.data.reporterId == request.auth.uid || isAdmin());
+
+      allow update: if isAdmin()
+        && changed(['status', 'resolvedBy', 'resolvedAt'])
+        && request.resource.data.status in ['open', 'resolved', 'dismissed'];
+
+      allow delete: if false;
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

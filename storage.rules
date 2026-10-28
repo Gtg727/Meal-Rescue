@@ -1,0 +1,21 @@
+rules_version = '2';
+
+// Food photos live at donations/{providerUid}/{file}. Only the signed-in owner
+// may upload; images must be JPG/PNG and under 5 MB (mirrors kMaxImageBytes).
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /donations/{uid}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource != null
+        && request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png)');
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

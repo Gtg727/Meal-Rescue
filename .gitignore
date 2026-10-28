@@ -1,0 +1,21 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+*.iml
+.idea/
+.vscode/
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/google-services.json
+*.jks
+key.properties
+
+# Firebase
+.firebaserc
+firebase-debug.log
+functions/node_modules/
