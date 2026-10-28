@@ -19,3 +19,4 @@ key.properties
 .firebaserc
 firebase-debug.log
 functions/node_modules/
+tool/node_modules/
